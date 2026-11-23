@@ -1,0 +1,10 @@
+{
+  "name": "figma-native-export",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Resumable local backups using Figma's native Save local copy command",
+  "engines": {"node": ">=22"},
+  "scripts": {"start": "node cli.mjs", "test": "node --test && python3 -m unittest discover -s tests -v"},
+  "dependencies": {"playwright-core": "1.65.1"}
+}
