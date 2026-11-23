@@ -43,9 +43,10 @@ export function safeName(s){
 async function heading(p){
   return await firstVisible(p.getByRole('button',{name:'Main menu',exact:true}).or(p.getByRole('combobox',{name:'Main menu',exact:true})).or(p.locator('[aria-label="Main menu"]')));
 }
-async function waitReady(p,test,timeout=65000){
+async function waitReady(p,test,timeout=65000,check){
   const deadline=Date.now()+timeout;
   while(Date.now()<deadline){
+    await check?.();
     const v=await test(); if(v)return v;
     if(p.isClosed())throw new Stop('The Figma window was closed');
     await sleep(500);
@@ -59,6 +60,13 @@ function sameListing(a,b){
   // Figma normalizes the host and may use a project/folder alias for the same ID.
   return folderKey(a)?folderKey(a)===folderKey(b):left.pathname.replace(/\/$/,'')===right.pathname.replace(/\/$/,'');
 }
+async function cardControl(p,x){
+  const [visible]=await waitForCards(async()=>{const found=await findCard(p,x.label,x.index,x.position);return found?[found]:[];},{timeout:10000,interval:400});
+  if(visible)return visible;
+  await scanInventory(p);
+  return findCard(p,x.label,x.index,x.position);
+}
+
 async function openCard(p,ctx,x,kind){
   const expected=kind==='file'&&fileRef(x.anchor);
   if(expected){
@@ -67,9 +75,7 @@ async function openCard(p,ctx,x,kind){
     try {await go(editor,x.anchor);return {p:editor,ref:expected};}
     catch(e){await editor.close().catch(()=>{});throw e;}
   }
-  const [visible]=await waitForCards(async()=>{const found=await findCard(p,x.label,x.index,x.position);return found?[found]:[];},{timeout:10000,interval:400});
-  let clickTarget=visible;
-  if(!clickTarget){await scanInventory(p);clickTarget=await findCard(p,x.label,x.index,x.position);}
+  const clickTarget=await cardControl(p,x);
   if(!clickTarget)throw new Skip('The card is no longer present in the listing');
   const old=p.url(), pages=new Set(ctx.pages());
   const after=()=>ctx.pages().find(q=>!pages.has(q)&&fileRef(q.url()));
@@ -114,6 +120,18 @@ function commitArchive(args){
     });
   });
 }
+class InterruptedDownload extends Error {}
+
+async function waitForTransfer(download,timeout){
+  const timer=new AbortController();
+  try {
+    await Promise.race([
+      download.path().catch(e=>{throw new InterruptedDownload('Chrome did not complete the download',{cause:e});}),
+      sleep(timeout,undefined,{signal:timer.signal}).then(()=>{throw new InterruptedDownload('Chrome download timed out');}),
+    ]);
+  } finally {timer.abort();}
+}
+
 async function saveDownload(download,ref,title,parts,root){
   const fname=safeName(download.suggestedFilename());
   const ext=path.extname(fname).toLowerCase();
@@ -132,13 +150,17 @@ async function saveDownload(download,ref,title,parts,root){
   }
 }
 async function invokeExport(p,verifyTarget,arm){
-  const main=await waitReady(p,async()=>await heading(p),85000);
+  const check=async()=>{
+    if(await seenChallenge(p)!=='ready')throw new InterruptedDownload('Figma requested sign-in or verification while opening the export menu');
+    verifyTarget();
+  };
+  const main=await waitReady(p,()=>heading(p),85000,check);
   await main.click({timeout:8000});
-  const f=await waitReady(p,async()=>await firstVisible(exact(p,'menuitem','File')),9000);
+  const f=await waitReady(p,()=>firstVisible(exact(p,'menuitem','File')),9000,check);
   await f.click({timeout:8000});
-  const save=await waitReady(p,async()=>await firstVisible(p.getByRole('menuitem',{name:/^Save local copy/})),9000);
+  const save=await waitReady(p,()=>firstVisible(p.getByRole('menuitem',{name:/^Save local copy/})),9000,check);
   if(!(await save.isEnabled()))throw new Skip('Figma does not allow saving a local copy');
-  verifyTarget();
+  await check();
   arm();
   await save.click({timeout:8000});
 }
@@ -163,43 +185,93 @@ async function waitUser(p,state,title,autoCaptcha,timeout=30*60_000){
   }
   throw new Stop('The Figma window was closed');
 }
-export async function exportFile(p,ref,title,parts,state,{root,autoCaptcha,downloadTimeout=20*60_000}){
+export async function exportFile(p,ref,title,parts,state,{root,autoCaptcha,downloadTimeout=20*60_000,transferTimeout=downloadTimeout}){
   const disk=await statfs(root); if(disk.bavail*disk.bsize<2*1024**3)throw new Stop('Less than 2 GiB of free disk space remains');
-  let dl=null, armed=false;
+  let dl=null, armed=false, documentVersion=0;
   const listener=d=>{if(armed&&!dl&&/^(blob:)?https:\/\/(www\.)?figma\.com\//.test(d.url())) dl=d;};
+  const documentLoaded=()=>{documentVersion++;};
   const verifyTarget=()=>{if(editorRef(p.url())?.key!==ref.key)throw new Skip('Figma redirected to a different file');};
   p.on('download',listener);
+  p.on('domcontentloaded',documentLoaded);
   try {
     for(let attempt=0;attempt<3;attempt++){
-      await waitUser(p,state,title,autoCaptcha);
-      if(dl) return await saveDownload(dl,ref,title,parts,root);
-      if(fileRef(p.url())?.key!==ref.key)await go(p,ref.url);
-      await waitUser(p,state,title,autoCaptcha);
-      verifyTarget();
-      await state('exporting',{file:title,project:parts});
-      await invokeExport(p,verifyTarget,()=>{armed=true;});
-      let restart=false, deadline=Date.now()+downloadTimeout;
-      while(Date.now()<deadline){
-        if(dl)return await saveDownload(dl,ref,title,parts,root);
-        const challenge=await seenChallenge(p);
-        if(challenge!=='ready'){
-          await waitUser(p,state,title,autoCaptcha);
-          // If Figma itself resumed, collect its download rather than clicking again.
-          for(let i=0;i<10;i++){
-            if(dl)return await saveDownload(dl,ref,title,parts,root);
-            if(/Downloading images|Save partial file|Preparing (?:your )?(?:download|file)/i.test(await texts(p))){deadline=Date.now()+downloadTimeout;break;}
-            if(i===9)restart=true;
-            await sleep(500);
+      let started=documentVersion;
+      try {
+        await waitUser(p,state,title,autoCaptcha);
+        if(fileRef(p.url())?.key!==ref.key)await go(p,ref.url);
+        await waitUser(p,state,title,autoCaptcha);
+        verifyTarget();
+        started=documentVersion;
+        await state('exporting',{file:title,project:parts,attempt:attempt+1});
+        // The document can reload while a Playwright click or menu wait is still in flight.
+        let menuInterrupted=false;
+        try {
+          await invokeExport(p,verifyTarget,()=>{armed=true;});
+        } catch(e) {
+          if(!dl){
+            if(e instanceof Stop||p.isClosed())throw e;
+            if(!(e instanceof InterruptedDownload)&&await seenChallenge(p)==='ready'&&!dl)throw e;
+            menuInterrupted=true;
           }
-          if(restart)break;
-          await state('exporting',{file:title,project:parts});
-        } else if(fileRef(p.url())?.key!==ref.key) {restart=true;break;}
-        await sleep(800);
+        }
+        let deadline=Date.now()+downloadTimeout;
+        while(Date.now()<deadline&&!dl){
+          if(p.isClosed())throw new Stop('The Figma window was closed');
+          const challenge=await seenChallenge(p);
+          if(menuInterrupted||challenge!=='ready'){
+            await waitUser(p,state,title,autoCaptcha);
+            if(!dl)verifyTarget();
+            if(!armed)throw new InterruptedDownload('Figma interrupted the export menu before Save local copy');
+            // Figma sometimes resumes the same export after manual verification.
+            let resumed=false;
+            for(let i=0;i<10&&!dl;i++){
+              if(/Downloading images|Save partial file|Preparing (?:your )?(?:download|file)/i.test(await texts(p))){resumed=true;break;}
+              await sleep(500);
+            }
+            if(!dl&&!resumed)throw new InterruptedDownload('Figma did not resume the export after verification');
+            menuInterrupted=false;
+            started=documentVersion;
+            deadline=Date.now()+downloadTimeout;
+            await state('exporting',{file:title,project:parts,attempt:attempt+1});
+          } else if(documentVersion!==started){
+            verifyTarget();
+            if(!dl)throw new InterruptedDownload('The editor reloaded before the download started');
+          } else if(editorRef(p.url())?.key!==ref.key){
+            verifyTarget();
+          }
+          if(!dl)await sleep(800);
+        }
+        if(!dl)throw new Skip('Figma did not finish the export before the download deadline');
+        await state('downloading',{file:title,project:parts,attempt:attempt+1});
+        await waitForTransfer(dl,transferTimeout);
+        return await saveDownload(dl,ref,title,parts,root);
+      } catch(e){
+        if(e instanceof Stop||p.isClosed())throw e;
+        const reloaded=!dl&&documentVersion!==started&&editorRef(p.url())?.key===ref.key;
+        if(!(e instanceof InterruptedDownload)&&!reloaded)throw e;
+        armed=false;
+        if(dl){
+          const abandoned=dl;
+          dl=null;
+          const timer=new AbortController();
+          try {
+            await Promise.race([
+              abandoned.cancel(),
+              sleep(5000,undefined,{signal:timer.signal}).then(()=>{throw Error('Chrome did not acknowledge cancellation');}),
+            ]);
+          } catch(cause) {throw new Stop('Could not safely cancel the stalled Chrome download',{cause});}
+          finally {timer.abort();}
+        }
+        if(attempt===2)throw new Skip('Export interrupted after three attempts: '+e.message,{cause:e});
+        await state('retrying',{file:title,project:parts,attempt:attempt+2,reason:e.message.split('\n')[0]});
+        // Clear a stale export/menu only when an external refresh did not already replace it.
+        if(!reloaded){
+          verifyTarget();
+          await go(p,ref.url);
+        }
       }
-      if(!restart)throw new Skip('Figma did not finish the export before the download deadline');
     }
-    throw new Skip('Figma did not start a download after three export attempts');
-  } finally {p.off('download',listener);}
+  } finally {p.off('domcontentloaded',documentLoaded);p.off('download',listener);}
 }
 export async function run({page,ctx,state,config,exportNative=exportFile}){
   const {root,scopes,rescan,autoCaptcha}=config;
@@ -244,8 +316,8 @@ export async function run({page,ctx,state,config,exportNative=exportFile}){
       if(!verified)await addIssue(parts,Error(`Inventory completeness could not be verified (${observed} observed, ${expected ?? 'no reliable total'}); no checkpoint was saved`));
       let complete=verified&&unknown.length===0;
       const keys=new Set();
-      for(const x of rows){
-        let q=page,ref;
+      for(const [index,x] of rows.entries()){
+        let q=page,ref,exportAttempted=false;
         try{
           const d=await store.read();
           const childParts=[...parts,x.title];
@@ -259,6 +331,7 @@ export async function run({page,ctx,state,config,exportNative=exportFile}){
           if(archived?.status==='saved'&&await store.exists(archived.path,archived.bytes)){
             keys.add(anchored.key);continue;
           }
+          await state('locating',{file:x.title,project:parts,item:index+1,total:rows.length});
           if(!sameListing(page.url(),backUrl))await go(page,backUrl);
           await waitUser(page,state,x.title,autoCaptcha);
           if(!sameListing(page.url(),backUrl))throw new Skip('Figma redirected while reopening the listing');
@@ -278,6 +351,7 @@ export async function run({page,ctx,state,config,exportNative=exportFile}){
               const name=await b?.innerText().catch(()=>null);
               if(name?.trim())dest=[...parts,name.trim()];
             }
+            exportAttempted=true;
             try {await exportNative(q,ref,x.title,dest,state,config);}
             finally {store.reload();}
           }
@@ -290,8 +364,9 @@ export async function run({page,ctx,state,config,exportNative=exportFile}){
           await addIssue([...parts,x.title],e,ref,x.title);
         }finally{
           if(q!==page&&!q.isClosed())await q.close().catch(()=>{});
-          // Retire a tab that hosted an editor; late downloads cannot reach the next file's listener.
-          if(q===page&&fileRef(page.url())&&!page.isClosed()){
+          // Only an actual export could leave a late download behind. Merely identifying an
+          // already archived file must not close and reopen the main browser tab.
+          if(exportAttempted&&q===page&&!page.isClosed()){
             const previous=page;
             page=await ctx.newPage();
             await previous.close().catch(()=>{});

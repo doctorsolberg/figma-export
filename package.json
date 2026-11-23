@@ -2,6 +2,7 @@
   "name": "figma-native-export",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "Resumable local backups using Figma's native Save local copy command",
   "engines": {"node": ">=22"},

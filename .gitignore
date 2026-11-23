@@ -8,10 +8,12 @@ __pycache__/
 chrome-profile/
 backup-report.json
 backup-report.json.bak
+backup-report.json.*
 _unverified/
 .playwright-*
 .report-*
 browser-status.json
+browser-status.json.*
 .backup.lock
 playwright-report/
 figma-backups/
