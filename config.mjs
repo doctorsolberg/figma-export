@@ -2,6 +2,8 @@ import {parseArgs} from 'node:util';
 import {homedir} from 'node:os';
 import path from 'node:path';
 
+export const defaultExportTimeoutMinutes=20;
+
 export const help=`Figma Export — save importable native copies through Figma's editor
 
 Usage: npm start -- --team "NAME=TEAM_ID" [--team "NAME=TEAM_ID" ...]
@@ -15,6 +17,9 @@ Usage: npm start -- --team "NAME=TEAM_ID" [--team "NAME=TEAM_ID" ...]
   --profile DIRECTORY     Dedicated Chrome profile (default: per-user).
   --rescan                Ignore completed-folder checkpoints; rediscover
                           files, but do not replace existing copies.
+  --export-timeout-minutes N
+                          Wait up to N minutes for preparation and, separately,
+                          transfer (1–120; default: ${defaultExportTimeoutMinutes}).
   --manual-start-captcha  Leave Verify and Begin to the user as well.
   --help                  Show this help.
 `;
@@ -32,8 +37,11 @@ function pair(value){
   return [names,value.slice(i+1).trim()];
 }
 export function options(args){
-  const {values:v}=parseArgs({args,options:{team:{type:'string',multiple:true},scope:{type:'string',multiple:true},out:{type:'string'},profile:{type:'string'},rescan:{type:'boolean'},'manual-start-captcha':{type:'boolean'},help:{type:'boolean',short:'h'}},allowPositionals:false});
+  const {values:v}=parseArgs({args,options:{team:{type:'string',multiple:true},scope:{type:'string',multiple:true},out:{type:'string'},profile:{type:'string'},rescan:{type:'boolean'},'export-timeout-minutes':{type:'string'},'manual-start-captcha':{type:'boolean'},help:{type:'boolean',short:'h'}},allowPositionals:false});
   if(v.help)return {help:true};
+  const rawTimeout=v['export-timeout-minutes']??String(defaultExportTimeoutMinutes);
+  const minutes=Number(rawTimeout);
+  if(!/^\d+$/.test(rawTimeout)||minutes<1||minutes>120)throw Error('--export-timeout-minutes must be a whole number from 1 to 120');
   const scopes=[];
   for(const item of v.team??[]){
     const [parts,value]=pair(item);
@@ -54,5 +62,5 @@ export function options(args){
   const mainChrome=process.platform==='darwin'?path.join(homedir(),'Library','Application Support','Google','Chrome'):path.join(homedir(),'.config','google-chrome');
   const under=(a,b)=>a===b||a.startsWith(b+path.sep);
   if(under(profile,mainChrome)||under(root,profile)||under(profile,root))throw Error('Use a separate Chrome profile, outside the normal Chrome profile and archive directory.');
-  return {scopes,root,profile,rescan:!!v.rescan,autoCaptcha:!v['manual-start-captcha']};
+  return {scopes,root,profile,rescan:!!v.rescan,autoCaptcha:!v['manual-start-captcha'],downloadTimeout:minutes*60_000};
 }

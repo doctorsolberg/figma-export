@@ -59,8 +59,12 @@ test('first scan persists a folder; resume avoids its page; rescan finds a new f
  assert.equal(latest.files.C.status,'not_saved');assert.equal(latest.completedFolders[folderKey(project)],undefined);
  revision=3;
  assert.equal((await execute(true,[{url:project,parts:['Team','Design']}])).issues,1);
- assert.match(JSON.parse(await readFile(report)).issues[0].reason,/Whiteboard file/);
- assert.equal(JSON.parse(await readFile(report)).completedFolders[folderKey(project)],undefined);
+ const unresolved=JSON.parse(await readFile(report));
+ assert.match(unresolved.issues[0].reason,/Whiteboard file/);
+ assert.equal(unresolved.issues[0].code,'unresolved_listing_entry');
+ assert.equal(unresolved.issues[0].listing,project);
+ assert.equal(unresolved.issues[0].evidence.row,'3');
+ assert.equal(unresolved.completedFolders[folderKey(project)],undefined);
  const redirect=base+'/recents-and-sharing/shared-with-you';
  await ctx.route(redirect,r=>r.fulfill({contentType:'text/html',body:`<script>history.replaceState(null,'',${JSON.stringify(scope.url)})</script>`+folderHTML('')}));
  assert.equal((await execute(false,[{url:redirect,parts:['Shared']}])).issues,1);

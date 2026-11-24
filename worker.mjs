@@ -4,9 +4,9 @@ import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import path from 'node:path';
 import {setTimeout as sleep} from 'node:timers/promises';
-import {browserListing} from './config.mjs';
+import {browserListing,defaultExportTimeoutMinutes} from './config.mjs';
 import {folderKey,forgetFolder,recordFolder,reusableFolder,invalidateFiles} from './checkpoints.mjs';
-import {findCard,scanInventory,waitForCards} from './inventory.mjs';
+import {findCard,recoverCard,relocateUniqueCard,scanInventory,waitForCards} from './inventory.mjs';
 import {reportStore,Skip,Stop} from './report-store.mjs';
 import {trustedChallengeUrl,autoStartChallenge} from './captcha-start.mjs';
 export {reportStore} from './report-store.mjs';
@@ -61,10 +61,12 @@ function sameListing(a,b){
   return folderKey(a)?folderKey(a)===folderKey(b):left.pathname.replace(/\/$/,'')===right.pathname.replace(/\/$/,'');
 }
 async function cardControl(p,x){
-  const [visible]=await waitForCards(async()=>{const found=await findCard(p,x.label,x.index,x.position);return found?[found]:[];},{timeout:10000,interval:400});
+  const [visible]=await waitForCards(async()=>{const found=await findCard(p,x.label,x.index,x.position,x.virtualIndex);return found?[found]:[];},{timeout:1500,interval:250});
   if(visible)return visible;
-  await scanInventory(p);
-  return findCard(p,x.label,x.index,x.position);
+  const recovered=await recoverCard(p,x);
+  if(recovered)return recovered;
+  if(x.virtualIndex!=null&&/\/recently-viewed\/?$/.test(new URL(p.url()).pathname))return relocateUniqueCard(p,x);
+  return null;
 }
 
 async function openCard(p,ctx,x,kind){
@@ -185,7 +187,7 @@ async function waitUser(p,state,title,autoCaptcha,timeout=30*60_000){
   }
   throw new Stop('The Figma window was closed');
 }
-export async function exportFile(p,ref,title,parts,state,{root,autoCaptcha,downloadTimeout=20*60_000,transferTimeout=downloadTimeout}){
+export async function exportFile(p,ref,title,parts,state,{root,autoCaptcha,downloadTimeout=defaultExportTimeoutMinutes*60_000,transferTimeout=downloadTimeout}){
   const disk=await statfs(root); if(disk.bavail*disk.bsize<2*1024**3)throw new Stop('Less than 2 GiB of free disk space remains');
   let dl=null, armed=false, documentVersion=0;
   const listener=d=>{if(armed&&!dl&&/^(blob:)?https:\/\/(www\.)?figma\.com\//.test(d.url())) dl=d;};
@@ -278,12 +280,12 @@ export async function run({page,ctx,state,config,exportNative=exportFile}){
   const store=reportStore(root);
   const active=new Set(), results=new Map();
   let skippedFolders=0;
-  const addIssue=async (parts,error,ref,title)=>{
+  const addIssue=async (parts,error,ref,title,details={})=>{
     const reason=String(error.message??error).split('\n')[0];
     const old=ref&&(await store.read()).files[ref.key];
     const stillSaved=old?.status==='saved'&&await store.exists(old.path,old.bytes);
     await store.update(d=>{
-      d.issues.push({scope:parts.join('/'),reason});
+      d.issues.push({scope:parts.join('/'),reason,...details});
       if(ref&&!stillSaved)d.files[ref.key]={title,url:ref.url,status:'not_saved',reason};
     });
     console.error('Skipped '+parts.join('/')+': '+reason);
@@ -310,10 +312,12 @@ export async function run({page,ctx,state,config,exportNative=exportFile}){
       if(!sameListing(page.url(),u))throw new Skip('Figma redirected to a different listing');
       const backUrl=page.url();
       await waitReady(page,async()=>await firstVisible(page.getByRole('button',{name:'Recents',exact:true}).or(page.getByText('All folders',{exact:true}))),55000);
-      const {cards:rows,unknown,verified,expected,observed}=await scanInventory(page);
+      const {cards:rows,unknown,verified,expected,observed,coverageGap}=await scanInventory(page);
       console.log(parts.join('/')+': '+rows.length+' cards');
-      for(const row of unknown)await addIssue(parts,Error('Unrecognized or unsupported listing entry: '+row.label));
-      if(!verified)await addIssue(parts,Error(`Inventory completeness could not be verified (${observed} observed, ${expected ?? 'no reliable total'}); no checkpoint was saved`));
+      for(const row of unknown)await addIssue(parts,Error('Unrecognized or unsupported listing entry: '+row.label),null,null,
+        {code:'unresolved_listing_entry',listing:localKey(backUrl),evidence:row.evidence});
+      if(!verified&&coverageGap!=='unresolved_entries')await addIssue(parts,Error(`Inventory completeness could not be verified (${observed} observed, ${expected ?? 'no reliable total'}; ${coverageGap}); no checkpoint was saved`),null,null,
+        {code:'unverified_inventory',listing:localKey(backUrl),coverageGap,observed,expected});
       let complete=verified&&unknown.length===0;
       const keys=new Set();
       for(const [index,x] of rows.entries()){
